@@ -3,6 +3,7 @@ package sifive.blocks.devices.gpio
 
 import Chisel.{defaultCompileOptions => _, _}
 import chisel3.{VecInit}
+import scala.math._
 import freechips.rocketchip.util.CompileOptions.NotStrictInferReset
 
 import freechips.rocketchip.config.{Field, Parameters}
@@ -43,7 +44,8 @@ case class GPIOParams(
   includeIOF: Boolean = false,
   dsWidth: Int = 1,
   hasPS: Boolean = false,
-  hasPOE: Boolean = false) extends DeviceParams
+  hasPOE: Boolean = false,
+  hasmask: Boolean =false) extends DeviceParams
 
 /** The base GPIO peripheral functionality, which uses the regmap API to
   * abstract over the bus protocol to which it is being connected
@@ -72,6 +74,8 @@ abstract class GPIO(busWidthBytes: Int, c: GPIOParams)(implicit p: Parameters)
   //--------------------------------------------------
   // CSR Declarations
   // -------------------------------------------------
+  val outputmaskReg = Reg(init = UInt(0, c.width))
+  val inputmaskReg = Reg(init = UInt(0, c.width))
 
   // SW Control only.
   val portReg = Reg(init = UInt(0, c.width))
@@ -85,8 +89,17 @@ abstract class GPIO(busWidthBytes: Int, c: GPIOParams)(implicit p: Parameters)
 
   // Synchronize Input to get valueReg
   val inVal = Wire(UInt(0, width=c.width))
+  val inSyncReg = Reg(UInt(0, width=c.width))
   inVal := Vec(port.pins.map(_.i.ival)).asUInt
-  val inSyncReg  = SynchronizerShiftReg(inVal, 3, Some("inSyncReg"))
+  
+  if(c.hasmask)
+  {
+   val inSyncReg  = SynchronizerShiftReg(inVal, 3, Some("inSyncReg")) & !inputmaskReg
+  }
+  else
+  {
+   val inSyncReg  = SynchronizerShiftReg(inVal, 3, Some("inSyncReg"))
+  }
   val valueReg   = Reg(init = UInt(0, c.width), next = inSyncReg)
 
   // Interrupt Configuration
@@ -114,6 +127,8 @@ abstract class GPIO(busWidthBytes: Int, c: GPIOParams)(implicit p: Parameters)
 
   val rise = ~valueReg & inSyncReg;
   val fall = valueReg & ~inSyncReg;
+  
+  val size = ceil(c.width/8.0).toInt;
 
   val iofEnFields =  if (c.includeIOF) (Seq(RegField.rwReg(c.width, iofEnReg.io,
                         Some(RegFieldDesc("iof_en","HW I/O functon enable", reset=Some(0))))))
@@ -131,7 +146,7 @@ abstract class GPIO(busWidthBytes: Int, c: GPIOParams)(implicit p: Parameters)
                         Seq(RegField(c.width, dsReg(i),
                               RegFieldDesc(s"ds$i", s"Pin drive strength $i selection", reset=Some(0)))))
   val dsRegMap = for ((rd, i) <- dsRegsAndDescs.zipWithIndex)
-                   yield (GPIOCtrlRegs.drive + 4*i -> Seq(RegField(c.width, dsReg(i),
+                   yield ((GPIOCtrlRegs.drive *size)+ size*i) -> Seq(RegField(c.width, dsReg(i),
                           RegFieldDesc(s"ds$i",s"Pin drive strength $i selection", reset=Some(0)))))
 
   // shift other register offset when c.dsWidth > 1
@@ -139,42 +154,47 @@ abstract class GPIO(busWidthBytes: Int, c: GPIOParams)(implicit p: Parameters)
 
   // Note that these are out of order.
   val mapping = Seq(
-    GPIOCtrlRegs.value     -> Seq(RegField.r(c.width, valueReg,
+    GPIOCtrlRegs.value * size   -> Seq(RegField.r(c.width, valueReg,
                                   RegFieldDesc("input_value","Pin value", volatile=true))),
-    GPIOCtrlRegs.input_en  -> Seq(RegField.rwReg(c.width, ieReg.io,
+    GPIOCtrlRegs.input_en * size -> Seq(RegField.rwReg(c.width, ieReg.io,
                                   Some(RegFieldDesc("input_en","Pin input enable", reset=Some(0))))),
-    GPIOCtrlRegs.output_en -> Seq(RegField.rwReg(c.width, oeReg.io,
+    GPIOCtrlRegs.output_en * size -> Seq(RegField.rwReg(c.width, oeReg.io,
                                   Some(RegFieldDesc("output_en","Pin output enable", reset=Some(0))))),
-    GPIOCtrlRegs.port      -> Seq(RegField(c.width, portReg,
+    GPIOCtrlRegs.port * size     -> Seq(RegField(c.width, portReg,
                                   RegFieldDesc("output_value","Output value", reset=Some(0)))),
-    GPIOCtrlRegs.pullup_en -> Seq(RegField.rwReg(c.width, pueReg.io,
+    GPIOCtrlRegs.pullup_en * size-> Seq(RegField.rwReg(c.width, pueReg.io,
                                   Some(RegFieldDesc("pue","Internal pull-up enable", reset=Some(0))))),
-    GPIOCtrlRegs.rise_ie + dsOffset -> Seq(RegField(c.width, riseIeReg,
+    GPIOCtrlRegs.rise_ie  * size + dsOffset -> Seq(RegField(c.width, riseIeReg,
                                   RegFieldDesc("rise_ie","Rise interrupt enable", reset=Some(0)))),
-    GPIOCtrlRegs.rise_ip + dsOffset -> Seq(RegField.w1ToClear(c.width, riseIpReg, rise,
+    GPIOCtrlRegs.rise_ip * size + dsOffset -> Seq(RegField.w1ToClear(c.width, riseIpReg, rise,
                                   Some(RegFieldDesc("rise_ip","Rise interrupt pending", volatile=true)))),
-    GPIOCtrlRegs.fall_ie + dsOffset -> Seq(RegField(c.width, fallIeReg,
+    GPIOCtrlRegs.fall_ie * size + dsOffset -> Seq(RegField(c.width, fallIeReg,
                                   RegFieldDesc("fall_ie", "Fall interrupt enable", reset=Some(0)))),
-    GPIOCtrlRegs.fall_ip + dsOffset -> Seq(RegField.w1ToClear(c.width, fallIpReg, fall,
+    GPIOCtrlRegs.fall_ip * size + dsOffset -> Seq(RegField.w1ToClear(c.width, fallIpReg, fall,
                                   Some(RegFieldDesc("fall_ip","Fall interrupt pending", volatile=true)))),
-    GPIOCtrlRegs.high_ie + dsOffset -> Seq(RegField(c.width, highIeReg,
+    GPIOCtrlRegs.high_ie  * size + dsOffset -> Seq(RegField(c.width, highIeReg,
                                   RegFieldDesc("high_ie","High interrupt enable", reset=Some(0)))),
-    GPIOCtrlRegs.high_ip + dsOffset -> Seq(RegField.w1ToClear(c.width, highIpReg, valueReg,
+    GPIOCtrlRegs.high_ip * size + dsOffset -> Seq(RegField.w1ToClear(c.width, highIpReg, valueReg,
                                   Some(RegFieldDesc("high_ip","High interrupt pending", volatile=true)))),
-    GPIOCtrlRegs.low_ie  + dsOffset -> Seq(RegField(c.width, lowIeReg,
+    GPIOCtrlRegs.low_ie * size + dsOffset -> Seq(RegField(c.width, lowIeReg,
                                   RegFieldDesc("low_ie","Low interrupt enable", reset=Some(0)))),
-    GPIOCtrlRegs.low_ip  + dsOffset -> Seq(RegField.w1ToClear(c.width,lowIpReg, ~valueReg,
+    GPIOCtrlRegs.low_ip * size + dsOffset -> Seq(RegField.w1ToClear(c.width,lowIpReg, ~valueReg,
                                   Some(RegFieldDesc("low_ip","Low interrupt pending", volatile=true)))),
-    GPIOCtrlRegs.iof_en  + dsOffset -> iofEnFields,
-    GPIOCtrlRegs.iof_sel + dsOffset -> iofSelFields,
-    GPIOCtrlRegs.out_xor + dsOffset -> Seq(RegField(c.width, xorReg,
+    GPIOCtrlRegs.iof_en * size + dsOffset -> iofEnFields,
+    GPIOCtrlRegs.iof_sel * size + dsOffset -> iofSelFields,
+    GPIOCtrlRegs.out_xor * size + dsOffset -> Seq(RegField(c.width, xorReg,
                                   RegFieldDesc("out_xor","Output XOR (invert) enable", reset=Some(0)))),
-    GPIOCtrlRegs.passthru_high_ie + dsOffset -> Seq(RegField(c.width, passthruHighIeReg,
+    GPIOCtrlRegs.passthru_high_ie * size + dsOffset -> Seq(RegField(c.width, passthruHighIeReg,
                                          RegFieldDesc("passthru_high_ie", "Pass-through active-high interrupt enable", reset=Some(0)))),
-    GPIOCtrlRegs.passthru_low_ie  + dsOffset -> Seq(RegField(c.width, passthruLowIeReg,
+    GPIOCtrlRegs.passthru_low_ie * size + dsOffset -> Seq(RegField(c.width, passthruLowIeReg,
                                          RegFieldDesc("passthru_low_ie", "Pass-through active-low interrupt enable", reset=Some(0)))),
-    GPIOCtrlRegs.ps  + dsOffset -> psFields,
-    GPIOCtrlRegs.poe + dsOffset -> poeFields
+    GPIOCtrlRegs.outputmask * size + dsOffset -> (if (c.hasmask) Seq(RegField(c.width, outputmaskReg,
+                                  RegFieldDesc("outputmask","output mask", reset=Some(0)))) else Seq()),
+    GPIOCtrlRegs.inputmask * size + dsOffset -> (if (c.hasmask) Seq(RegField(c.width, inputmaskReg,
+                                  RegFieldDesc("inputmask","input mask", reset=Some(0)))) else Seq()),
+   
+    GPIOCtrlRegs.ps  * size + dsOffset -> psFields,
+    GPIOCtrlRegs.poe * size + dsOffset -> poeFields
   )
   regmap(mapping ++ dsRegMap :_*)
   val omRegMap = OMRegister.convert(mapping:_*)
@@ -196,7 +216,18 @@ abstract class GPIO(busWidthBytes: Int, c: GPIOParams)(implicit p: Parameters)
 
     // Software Pin Control
     swPinCtrl(pin).pue    := pueReg.io.q(pin)
-    swPinCtrl(pin).oval   := portReg(pin)
+    if(c.hasmask){
+       when(!outputmaskReg(pin)) {
+         swPinCtrl(pin).oval := portReg(pin)
+       } 
+       .otherwise {
+          swPinCtrl(pin).oval := RegNext(port.pins(pin).o.oval)
+       } 
+    }
+    else {
+      swPinCtrl(pin).oval   := portReg(pin)
+    }
+  
     swPinCtrl(pin).oe     := oeReg.io.q(pin)
     swPinCtrl(pin).ds     := dsReg(0)(pin)
     swPinCtrl(pin).ie     := ieReg.io.q(pin)
