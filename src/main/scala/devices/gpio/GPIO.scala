@@ -150,7 +150,7 @@ abstract class GPIO(busWidthBytes: Int, c: GPIOParams)(implicit p: Parameters)
                           RegFieldDesc(s"ds$i",s"Pin drive strength $i selection", reset=Some(0)))))
 
   // shift other register offset when c.dsWidth > 1
-  val dsOffset = (c.dsWidth - 1) * 4
+  val dsOffset = (c.dsWidth - 1) * size
 
   // Note that these are out of order.
   val mapping = Seq(
